@@ -16,9 +16,12 @@ const STUN_SERVERS = [
   { urls: 'stun:stun4.l.google.com:19302' },
 ];
 
+// Бэкенд URL (можно менять на свой домен)
+const API_BASE = window.location.origin;
+const WS_BASE = API_BASE.replace(/^http/, 'ws');
+
 function generateTimestamp(): string {
-  const now = new Date();
-  return now.toLocaleTimeString('en-US', { hour12: false });
+  return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
 function generatePeerId(): string {
@@ -41,18 +44,26 @@ export default function App() {
   const [callDuration, setCallDuration] = useState<number>(0);
   const [connectedPeerNickname, setConnectedPeerNickname] = useState<string>('');
   const [copyVisible, setCopyVisible] = useState(false);
+  const [backendOnline, setBackendOnline] = useState<boolean>(false);
 
   const peerRef = useRef<Peer | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const activeCallRef = useRef<MediaConnection | null>(null);
   const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const logContainerRef = useRef<HTMLDivElement>(null);
+  const websocketRef = useRef<WebSocket | null>(null);
+  const nicknameRef = useRef<string>('');
+
+  // Синхронизация nickname ref для WebSocket
+  useEffect(() => {
+    nicknameRef.current = nickname;
+  }, [nickname]);
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
     setLogs(prev => [...prev, { timestamp: generateTimestamp(), message, type }]);
   }, []);
 
-  // Clock ticker
+  // ─── CLOCK ───
   useEffect(() => {
     const tick = () => setClock(generateTimestamp());
     tick();
@@ -60,14 +71,14 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Auto-scroll logs
+  // ─── AUTO-SCROLL LOGS ───
   useEffect(() => {
     if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
   }, [logs]);
 
-  // Call duration timer
+  // ─── CALL DURATION ───
   useEffect(() => {
     if (callStatus === 'active') {
       setCallDuration(0);
@@ -85,7 +96,105 @@ export default function App() {
     };
   }, [callStatus]);
 
-  // Initialize PeerJS
+  // ─── CHECK BACKEND ───
+  useEffect(() => {
+    fetch(`${API_BASE}/api/health`)
+      .then(res => res.json())
+      .then(() => {
+        setBackendOnline(true);
+        addLog('BACKEND SIGNALING SERVER: ONLINE', 'success');
+      })
+      .catch(() => {
+        setBackendOnline(false);
+        addLog('BACKEND UNREACHABLE — RUNNING IN STANDALONE MODE', 'info');
+        addLog('P2P CALLS WILL WORK VIA PEERJS PUBLIC BROKER', 'system');
+      });
+  }, []);
+
+  // ─── WEBSOCKET CONNECTION ───
+  const connectWebSocket = useCallback((id: string) => {
+    try {
+      const ws = new WebSocket(`${WS_BASE}/ws/${id}`);
+
+      ws.onopen = () => {
+        addLog('WEBSOCKET CHANNEL ESTABLISHED', 'success');
+        // Отправить никнейм если уже задан
+        if (nicknameRef.current) {
+          ws.send(JSON.stringify({
+            type: 'update_nickname',
+            nickname: nicknameRef.current,
+          }));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+
+          switch (message.type) {
+            case 'incoming_call':
+              addLog(`INCOMING CALL FROM: ${message.from_nickname || message.from_peer_id}`, 'info');
+              setConnectedPeerNickname(message.from_nickname || message.from_peer_id);
+              break;
+
+            case 'call_accepted':
+              addLog(`CALL ACCEPTED BY: ${message.from_peer_id}`, 'success');
+              break;
+
+            case 'call_rejected':
+              addLog(`CALL REJECTED BY: ${message.from_peer_id}`, 'error');
+              setCallStatus('idle');
+              break;
+
+            case 'call_ended':
+              addLog(`CALL ENDED BY: ${message.from_peer_id}`, 'info');
+              endCall();
+              break;
+
+            case 'pong':
+              // heartbeat response
+              break;
+          }
+        } catch {
+          // ignore malformed messages
+        }
+      };
+
+      ws.onclose = () => {
+        addLog('WEBSOCKET DISCONNECTED', 'error');
+        // Reconnect after delay
+        setTimeout(() => {
+          if (peerRef.current) {
+            connectWebSocket(id);
+          }
+        }, 3000);
+      };
+
+      ws.onerror = () => {
+        // Silent — onclose will handle reconnect
+      };
+
+      websocketRef.current = ws;
+    } catch {
+      addLog('WEBSOCKET INIT FAILED — RUNNING WITHOUT REALTIME NOTIFICATIONS', 'info');
+    }
+  }, [addLog]);
+
+  // ─── REGISTER PEER ON BACKEND ───
+  const registerOnBackend = useCallback(async (id: string, name: string) => {
+    try {
+      await fetch(`${API_BASE}/api/peers/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peer_id: id, nickname: name || 'ANON' }),
+      });
+      addLog('REGISTERED ON SIGNALING SERVER', 'success');
+    } catch {
+      // Silent — backend might not be available
+    }
+  }, [addLog]);
+
+  // ─── INITIALIZE PEERJS ───
   useEffect(() => {
     const id = generatePeerId();
     addLog('INITIALIZING PEER CONNECTION...', 'system');
@@ -100,12 +209,18 @@ export default function App() {
       setPeerId(id);
       addLog(`PEER ID ASSIGNED: ${id}`, 'success');
       addLog('STANDBY — AWAITING INCOMING OR OUTGOING CONNECTION', 'system');
+
+      // Connect WebSocket & register
+      connectWebSocket(id);
+      registerOnBackend(id, nicknameRef.current);
     });
 
     peerConnection.on('call', (incomingCall) => {
-      addLog(`INCOMING CALL FROM: ${incomingCall.peer}`, 'info');
+      const callerName = incomingCall.metadata?.nickname || incomingCall.peer;
+      addLog(`INCOMING CALL FROM: ${callerName}`, 'info');
       setCallStatus('ringing');
-      setConnectedPeerNickname(incomingCall.metadata?.nickname || incomingCall.peer);
+      setConnectedPeerNickname(callerName);
+      setTargetPeerId(incomingCall.peer);
 
       navigator.mediaDevices.getUserMedia({ audio: true, video: false })
         .then((audioStream) => {
@@ -113,7 +228,13 @@ export default function App() {
           incomingCall.answer(audioStream);
           bindCallEvents(incomingCall);
           setCallStatus('active');
-          addLog(`CONNECTED TO: ${incomingCall.metadata?.nickname || incomingCall.peer}`, 'success');
+          addLog(`CONNECTED TO: ${callerName}`, 'success');
+
+          // Notify via WebSocket
+          sendWsMessage({
+            type: 'call_accepted',
+            to_peer_id: incomingCall.peer,
+          });
         })
         .catch((err) => {
           addLog(`MICROPHONE ACCESS DENIED: ${err.message}`, 'error');
@@ -131,7 +252,7 @@ export default function App() {
     });
 
     peerConnection.on('disconnected', () => {
-      addLog('SIGNALING SERVER DISCONNECTED — ATTEMPTING RECONNECT', 'error');
+      addLog('SIGNALING SERVER DISCONNECTED — RECONNECTING', 'error');
       peerConnection.reconnect();
     });
 
@@ -139,9 +260,18 @@ export default function App() {
 
     return () => {
       peerConnection.destroy();
+      websocketRef.current?.close();
     };
   }, []);
 
+  // ─── WEBSOCKET HELPER ───
+  function sendWsMessage(payload: Record<string, unknown>) {
+    if (websocketRef.current?.readyState === WebSocket.OPEN) {
+      websocketRef.current.send(JSON.stringify(payload));
+    }
+  }
+
+  // ─── BIND CALL EVENTS ───
   function bindCallEvents(mediaConnection: MediaConnection) {
     activeCallRef.current = mediaConnection;
 
@@ -164,35 +294,51 @@ export default function App() {
     });
   }
 
+  // ─── INITIATE CALL ───
   async function initiateCall() {
     if (!peerRef.current || !targetPeerId.trim()) return;
 
-    const targetId = targetPeerId.trim();
-    addLog(`INITIATING CALL TO: ${targetId}`, 'info');
+    const resolvedTarget = targetPeerId.trim();
+    addLog(`INITIATING CALL TO: ${resolvedTarget}`, 'info');
     setCallStatus('connecting');
+
+    // Notify via WebSocket (if backend is online)
+    sendWsMessage({
+      type: 'call_request',
+      to_peer_id: resolvedTarget,
+      nickname: nickname || peerId,
+    });
 
     try {
       const audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       localStreamRef.current = audioStream;
 
-      const mediaConnection = peerRef.current.call(targetId, audioStream, {
+      const mediaConnection = peerRef.current.call(resolvedTarget, audioStream, {
         metadata: { nickname: nickname || peerId },
       });
 
       bindCallEvents(mediaConnection);
       setCallStatus('active');
-      setConnectedPeerNickname(targetId);
-      addLog(`CALL ACTIVE — CONNECTED TO ${targetId}`, 'success');
-    } catch (err: any) {
-      addLog(`CALL FAILED: ${err.message}`, 'error');
+      setConnectedPeerNickname(resolvedTarget);
+      addLog(`CALL ACTIVE — CONNECTED TO ${resolvedTarget}`, 'success');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      addLog(`CALL FAILED: ${message}`, 'error');
       setCallStatus('idle');
     }
   }
 
+  // ─── END CALL ───
   function endCall() {
     if (activeCallRef.current) {
+      const remotePeer = activeCallRef.current.peer;
       activeCallRef.current.close();
       activeCallRef.current = null;
+
+      sendWsMessage({
+        type: 'call_ended',
+        to_peer_id: remotePeer,
+      });
     }
 
     if (localStreamRef.current) {
@@ -212,6 +358,7 @@ export default function App() {
     addLog('CALL TERMINATED', 'system');
   }
 
+  // ─── TOGGLE MUTE ───
   function toggleMute() {
     if (!localStreamRef.current) return;
 
@@ -226,6 +373,7 @@ export default function App() {
     addLog(newMutedState ? 'MICROPHONE MUTED' : 'MICROPHONE UNMUTED', 'info');
   }
 
+  // ─── COPY PEER ID ───
   function copyPeerId() {
     if (!peerId) return;
     navigator.clipboard.writeText(peerId).then(() => {
@@ -235,6 +383,13 @@ export default function App() {
     });
   }
 
+  // ─── UPDATE NICKNAME ON BACKEND ───
+  function handleNicknameChange(value: string) {
+    setNickname(value);
+    sendWsMessage({ type: 'update_nickname', nickname: value });
+  }
+
+  // ─── FORMAT DURATION ───
   function formatDuration(seconds: number): string {
     const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
     const secs = (seconds % 60).toString().padStart(2, '0');
@@ -260,6 +415,12 @@ export default function App() {
         </div>
 
         <div className="status-indicator">
+          <span className={`status-indicator__dot ${backendOnline ? 'status-indicator__dot--connected' : ''}`} />
+          <span className="status-indicator__label">BACKEND</span>
+          <span className="status-indicator__value">{backendOnline ? 'LINKED' : 'STANDALONE'}</span>
+        </div>
+
+        <div className="status-indicator">
           <span className="status-indicator__label">NICK</span>
           <span className="status-indicator__value">{nickname || 'UNNAMED'}</span>
         </div>
@@ -274,7 +435,7 @@ export default function App() {
       <section className={`call-info ${callStatus === 'active' ? 'call-info--active' : ''}`}>
         <div className="call-info__peer">
           <span className="call-info__peer-name">{connectedPeerNickname}</span>
-          <span className="call-info__peer-id">[{targetPeerId || activeCallRef.current?.peer}]</span>
+          <span className="call-info__peer-id">[{targetPeerId}]</span>
         </div>
         <time className="call-info__duration">{formatDuration(callDuration)}</time>
       </section>
@@ -301,7 +462,7 @@ export default function App() {
                 className="identity-field__value identity-field__value--editable"
                 type="text"
                 value={nickname}
-                onChange={(e) => setNickname(e.target.value)}
+                onChange={(e) => handleNicknameChange(e.target.value)}
                 placeholder="ENTER CALLSIGN..."
                 maxLength={24}
               />
@@ -371,7 +532,7 @@ export default function App() {
       {/* Footer */}
       <footer className="terminal-footer">
         <span>PEERJS // WEBRTC // STUN RELAY</span>
-        <span>ENCRYPTED P2P CHANNEL</span>
+        <span>{backendOnline ? 'SIGNALING: ACTIVE' : 'MODE: STANDALONE'}</span>
       </footer>
 
       {/* Hidden audio element */}

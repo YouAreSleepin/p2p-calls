@@ -1,27 +1,46 @@
 """
-PEERLINK // FastAPI Signaling Server
-Serves the frontend and provides session management for peer discovery.
-PeerJS handles the actual WebRTC signaling via its own broker.
+PEERLINK // FastAPI Backend
+─────────────────────────────────────────────────
+• Раздача собранного фронтенда из dist/
+• Реестр активных пиров (in-memory)
+• WebSocket для real-time уведомлений
+• REST API для управления сессиями
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from datetime import datetime
-import uuid
 import json
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
 
-app = FastAPI(title="PEERLINK Server", version="1.0.0")
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+
+# ─── APP SETUP ────────────────────────────────────
+
+DIST_DIR = Path(__file__).parent / "dist"
+
+app = FastAPI(
+    title="PEERLINK",
+    version="1.0.0",
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# ─── MODELS ───────────────────────────────────────
 
 class PeerSession(BaseModel):
     peer_id: str
@@ -30,152 +49,249 @@ class PeerSession(BaseModel):
     status: str = "online"
 
 
-# In-memory peer registry (use Redis/DB in production)
+class RegisterRequest(BaseModel):
+    peer_id: str
+    nickname: Optional[str] = "ANON"
+
+
+class CallRequest(BaseModel):
+    from_peer_id: str
+    to_peer_id: str
+    nickname: str = "ANON"
+
+
+# ─── STATE ────────────────────────────────────────
+
 active_peers: dict[str, PeerSession] = {}
 
 
-@app.get("/")
-async def serve_frontend():
-    return FileResponse("dist/index.html")
+# ─── WEBSOCKET MANAGER ────────────────────────────
+
+class ConnectionManager:
+    """Управляет WebSocket-подключениями пиров."""
+
+    def __init__(self):
+        self._connections: dict[str, WebSocket] = {}
+
+    async def connect(self, peer_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self._connections[peer_id] = websocket
+
+    def disconnect(self, peer_id: str) -> None:
+        self._connections.pop(peer_id, None)
+
+    async def send_to(self, peer_id: str, payload: dict) -> bool:
+        """Отправить сообщение конкретному пиру. Возвращает True если доставлено."""
+        websocket = self._connections.get(peer_id)
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception:
+            self.disconnect(peer_id)
+            return False
+
+    def is_online(self, peer_id: str) -> bool:
+        return peer_id in self._connections
+
+    @property
+    def online_count(self) -> int:
+        return len(self._connections)
 
 
-@app.get("/health")
+ws_manager = ConnectionManager()
+
+
+# ─── API ROUTES ───────────────────────────────────
+
+@app.get("/api/health")
 async def health_check():
     return {
         "status": "operational",
-        "timestamp": datetime.utcnow().isoformat(),
-        "active_peers": len(active_peers),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "active_peers": ws_manager.online_count,
     }
 
 
-@app.post("/peer/register")
-async def register_peer(peer_id: str, nickname: str = "ANON"):
-    """Register a new peer session."""
+@app.post("/api/peers/register")
+async def register_peer(request: RegisterRequest):
     session = PeerSession(
-        peer_id=peer_id,
-        nickname=nickname,
-        connected_at=datetime.utcnow().isoformat(),
+        peer_id=request.peer_id,
+        nickname=request.nickname,
+        connected_at=datetime.now(timezone.utc).isoformat(),
     )
-    active_peers[peer_id] = session
-    return {"status": "registered", "peer_id": peer_id}
+    active_peers[request.peer_id] = session
+    return {"status": "registered", "peer": session.model_dump()}
 
 
-@app.delete("/peer/{peer_id}")
+@app.delete("/api/peers/{peer_id}")
 async def unregister_peer(peer_id: str):
-    """Remove a peer from the registry."""
-    if peer_id in active_peers:
-        del active_peers[peer_id]
+    removed = active_peers.pop(peer_id, None)
+    if removed:
         return {"status": "unregistered", "peer_id": peer_id}
-    return {"status": "not_found"}
+    return JSONResponse(status_code=404, content={"status": "not_found"})
 
 
-@app.get("/peers")
+@app.get("/api/peers")
 async def list_peers():
-    """List all active peers (for directory/discovery features)."""
-    return {
-        "peers": list(active_peers.values()),
-        "count": len(active_peers),
-    }
+    peers = [p.model_dump() for p in active_peers.values()]
+    return {"peers": peers, "count": len(peers)}
 
 
-@app.get("/peer/{peer_id}")
+@app.get("/api/peers/{peer_id}")
 async def get_peer(peer_id: str):
-    """Get info about a specific peer."""
     peer = active_peers.get(peer_id)
     if peer:
-        return peer
-    return {"status": "not_found"}
+        return peer.model_dump()
+    return JSONResponse(status_code=404, content={"status": "not_found"})
 
 
-class WebSocketConnectionManager:
-    """Manages WebSocket connections for real-time peer notifications."""
-
-    def __init__(self):
-        self.connections: dict[str, WebSocket] = {}
-
-    async def connect(self, peer_id: str, websocket: WebSocket):
-        await websocket.accept()
-        self.connections[peer_id] = websocket
-
-    def disconnect(self, peer_id: str):
-        self.connections.pop(peer_id, None)
-
-    async def notify_peer(self, peer_id: str, message: dict):
-        ws = self.connections.get(peer_id)
-        if ws:
-            await ws.send_json(message)
-
-    async def broadcast(self, message: dict, exclude: str | None = None):
-        for pid, ws in self.connections.items():
-            if pid != exclude:
-                try:
-                    await ws.send_json(message)
-                except Exception:
-                    self.disconnect(pid)
+@app.post("/api/call/request")
+async def request_call(call: CallRequest):
+    """
+    Отправить уведомление о входящем звонке через WebSocket.
+    PeerJS сам установит медиа-соединение, этот эндпоинт — для нотификаций.
+    """
+    delivered = await ws_manager.send_to(call.to_peer_id, {
+        "type": "incoming_call",
+        "from_peer_id": call.from_peer_id,
+        "from_nickname": call.nickname,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"delivered": delivered, "target_online": ws_manager.is_online(call.to_peer_id)}
 
 
-ws_manager = WebSocketConnectionManager()
-
+# ─── WEBSOCKET ENDPOINT ───────────────────────────
 
 @app.websocket("/ws/{peer_id}")
 async def peer_websocket(websocket: WebSocket, peer_id: str):
     """
-    WebSocket endpoint for real-time peer events.
-    Used for incoming call notifications, peer status updates, etc.
+    WebSocket для real-time событий:
+    - incoming_call — уведомление о входящем звонке
+    - call_accepted / call_rejected — ответ на звонок
+    - peer_online / peer_offline — статус пиров
+    - ping / pong — heartbeat
     """
     await ws_manager.connect(peer_id, websocket)
+
+    # Зарегистрировать пира
+    active_peers[peer_id] = PeerSession(
+        peer_id=peer_id,
+        nickname="ANON",
+        connected_at=datetime.now(timezone.utc).isoformat(),
+    )
+
     try:
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-
+            raw = await websocket.receive_text()
+            message = json.loads(raw)
             event_type = message.get("type")
 
-            if event_type == "call_request":
-                target_id = message.get("target_peer_id")
-                await ws_manager.notify_peer(target_id, {
-                    "type": "incoming_call",
-                    "from_peer_id": peer_id,
-                    "from_nickname": message.get("nickname", "ANON"),
-                    "timestamp": datetime.utcnow().isoformat(),
+            if event_type == "ping":
+                await ws_manager.send_to(peer_id, {
+                    "type": "pong",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
+
+            elif event_type == "update_nickname":
+                new_name = message.get("nickname", "ANON")
+                if peer_id in active_peers:
+                    active_peers[peer_id].nickname = new_name
+
+            elif event_type == "call_request":
+                target = message.get("to_peer_id")
+                if target:
+                    await ws_manager.send_to(target, {
+                        "type": "incoming_call",
+                        "from_peer_id": peer_id,
+                        "from_nickname": message.get("nickname", "ANON"),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
 
             elif event_type == "call_accepted":
-                target_id = message.get("target_peer_id")
-                await ws_manager.notify_peer(target_id, {
-                    "type": "call_accepted",
-                    "from_peer_id": peer_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                })
+                target = message.get("to_peer_id")
+                if target:
+                    await ws_manager.send_to(target, {
+                        "type": "call_accepted",
+                        "from_peer_id": peer_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
 
             elif event_type == "call_rejected":
-                target_id = message.get("target_peer_id")
-                await ws_manager.notify_peer(target_id, {
-                    "type": "call_rejected",
-                    "from_peer_id": peer_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                })
+                target = message.get("to_peer_id")
+                if target:
+                    await ws_manager.send_to(target, {
+                        "type": "call_rejected",
+                        "from_peer_id": peer_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
 
-            elif event_type == "ping":
-                await ws_manager.notify_peer(peer_id, {
-                    "type": "pong",
-                    "timestamp": datetime.utcnow().isoformat(),
-                })
+            elif event_type == "call_ended":
+                target = message.get("to_peer_id")
+                if target:
+                    await ws_manager.send_to(target, {
+                        "type": "call_ended",
+                        "from_peer_id": peer_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
 
     except WebSocketDisconnect:
         ws_manager.disconnect(peer_id)
-        if peer_id in active_peers:
-            del active_peers[peer_id]
-        await ws_manager.broadcast({
-            "type": "peer_offline",
-            "peer_id": peer_id,
-        })
+        active_peers.pop(peer_id, None)
 
 
-# Serve static frontend files
-app.mount("/assets", StaticFiles(directory="dist/assets"), name="assets")
+# ─── STATIC FILES (FRONTEND) ─────────────────────
 
+if DIST_DIR.exists():
+    # Монтируем ассеты ДО catch-all роута
+    assets_dir = DIST_DIR / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="static-assets")
+
+    # Catch-all: отдаём index.html для всех не-API путей (SPA fallback)
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # Попытаться отдать конкретный файл если он есть
+        file_path = DIST_DIR / full_path
+        if file_path.is_file():
+            return FileResponse(str(file_path))
+        # Иначе — index.html (SPA)
+        index = DIST_DIR / "index.html"
+        if index.exists():
+            return FileResponse(str(index))
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Frontend not built. Run: npm run build"},
+        )
+else:
+    @app.get("/")
+    async def frontend_not_built():
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "Frontend not built",
+                "hint": "Run 'npm run build' first to generate dist/",
+            },
+        )
+
+
+# ─── ENTRY POINT ──────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    print("""
+    ╔══════════════════════════════════════════╗
+    ║  PEERLINK // SIGNALING SERVER v1.0       ║
+    ║  API:    http://localhost:8000/api/docs  ║
+    ║  WS:     ws://localhost:8000/ws/{id}     ║
+    ╚══════════════════════════════════════════╝
+    """)
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )
